@@ -1,0 +1,6 @@
+transformers
+smart_open
+neptune-client
+pyarrow
+lightning
+neptune-pytorch-lightning
