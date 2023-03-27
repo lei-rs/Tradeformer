@@ -1,8 +1,6 @@
-from transformers import RobertaTokenizer, RobertaModel, RobertaConfig
-from transformers.optimization import get_cosine_schedule_with_warmup
+from transformers.optimization import get_constant_schedule_with_warmup
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import NeptuneLogger
-from torch.nn.functional import mse_loss
 from utils_data import *
 from models import *
 from keys import *
@@ -13,59 +11,43 @@ import uuid
 
 
 class EmbeddingTrainer(pl.LightningModule):
-    def __init__(self, input_dims, a2v_dim, n_encoders, n_heads, optimizer_params, warmup_steps, max_epochs,
-                 embedder, embedding_type, expand_dim=4, activation='gelu', dropout=0.1):
+    def __init__(self, model_params, optimizer_params, warmup_steps, max_epochs):
         super(EmbeddingTrainer, self).__init__()
         self.save_hyperparameters()
-
-        hidden_dim = input_dims[1]
-        if embedding_type in ('concat'):
-            hidden_dim += a2v_dim
 
         self.optimizer_params = optimizer_params
         self.warmup_steps = warmup_steps
         self.max_epochs = max_epochs
-        self.embedder = embedder
 
-        if embedder is None:
-            self.embed_dict = torch.randn(1961, a2v_dim).cuda()
+        self.Tradeformer = Tradeformer(**model_params)
 
-        self.embedding_type = embedding_type
-        self.TSEncoder = TSEncoderBlock(input_dims, hidden_dim, n_encoders, n_heads, expand_dim, activation, dropout)
-
-    def forward(self, x, input_ids, attention_mask, stock_num):
-        if self.embedder is None:
-            embedding = self.embed_dict[stock_num]
-
-        else:
-            embedding = self.embedder(input_ids, attention_mask)
-
-        if self.embedding_type == 'concat':
-            embedding = embedding.unsqueeze(1).repeat(1, x.shape[1], 1)
-            x = torch.cat((x, embedding), dim=-1)
-            return self.TSEncoder(x)
-
-        else:
-            return self.TSEncoder(x)
+    def forward(self, x, ticker):
+        return self.Tradeformer(x, ticker)
 
     def training_step(self, batch, batch_idx):
-        x, mask, mask2, input_ids, attention_mask, stock_num = batch
-        output = self(x.masked_fill(mask, 0), input_ids, attention_mask, stock_num)
-        loss = mse_loss(output.masked_fill(mask2, 0), x.masked_fill(mask2, 0))
-        self.log('train_loss', loss.item(), on_step=False, on_epoch=True, prog_bar=True)
+        x, y, ticker = batch
+        output = self(x, ticker)
+        loss = sharpe_loss(output, y)
+        self.log('train_score', loss.item(), on_step=False, on_epoch=True, prog_bar=True)
+        self.log('train_perfect', sharpe_loss(output, y, perfect=True).item(), on_step=False, on_epoch=True, prog_bar=True)
         return {'loss': loss}
 
     def validation_step(self, batch, batch_idx):
-        x, mask, mask2, input_ids, attention_mask, stock_num = batch
-        output = self(x.masked_fill(mask, 0), input_ids, attention_mask, stock_num)
-        loss = mse_loss(output.masked_fill(mask2, 0), x.masked_fill(mask2, 0))
-        self.log('val_loss', loss.item(), on_step=False, on_epoch=True, prog_bar=True)
-        return {'val_loss': loss}
+        x, y, ticker = batch
+        output = self(x, ticker)
+        loss = sharpe_loss(output, y)
+        self.log('val_score', loss.item(), on_step=False, on_epoch=True, prog_bar=True)
+        self.log('val_perfect', sharpe_loss(output, y, perfect=True).item(), on_step=False, on_epoch=True, prog_bar=True)
+        return {'val_score': loss}
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), **self.optimizer_params, amsgrad=True)
-        scheduler = get_cosine_schedule_with_warmup(optimizer, self.warmup_steps, self.max_epochs)
+        optimizer = torch.optim.AdamW(self.parameters(), **self.optimizer_params, amsgrad=True, maximize=True)
+        scheduler = get_constant_schedule_with_warmup(optimizer, self.warmup_steps)
         return [optimizer], [scheduler]
+
+    def get_embeddings(self):
+        self.Tradeformer.embedder.compile_embeds()
+        return self.Tradeformer.embedder.embeds
 
 
 if __name__ == '__main__':
@@ -80,67 +62,60 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--n_gpu', type=int, default=1)
-    parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--learning_rate', type=float, default=1e-3)
     parser.add_argument('--warmup_steps', type=int, default=10)
     parser.add_argument('--max_epochs', type=int, default=25)
-    parser.add_argument('--back_length', type=int, default=365)
-    parser.add_argument('--a2v_dim', type=int, default=30)
+    parser.add_argument('--back_length', type=int, default=300)
+    parser.add_argument('--forward_length', type=int, default=1)
+    parser.add_argument('--a2v_dim', type=int, default=6)
     args, _ = parser.parse_known_args()
 
-    roberta_config = RobertaConfig(
-        vocab_size=16000,
-        hidden_size=384,
-        num_hidden_layers=6,
-        intermediate_size=1536,
-        type_vocab_size=1
+    dm = A2VDataModule(
+        back_length=args.back_length,
+        forward_length=args.forward_length,
+        val_frac=0.3,
+        batch_size=args.batch_size,
+        total_train=500,
     )
-    TOKENIZER = RobertaTokenizer.from_pretrained('tokenizer/')
-    LM = RobertaModel(config=roberta_config, add_pooling_layer=False)
 
-    embd = Embedder(
-        a2v_dim=args.a2v_dim,
-        lm=LM,
-    )
+    MODEL_PARAMS = {
+        'dims': (args.back_length, 18, 18 + args.a2v_dim, args.forward_length),
+        'a2v_dim': args.a2v_dim,
+        'n_encoders': 6,
+        'n_heads': 6,
+        'n_mlp': 1,
+        'embd_meth': 'nlp',
+        'metadata': A2VDescriptions(),
+        'total': 1858,
+        'nlp_dims': (48, 6),
+    }
 
     OPTIM_PARAMS = {
         'lr': args.learning_rate,
     }
 
-    dm = A2VDataModule(
-        back_length=args.back_length,
-        val_frac=0.3,
-        batch_size=args.batch_size,
-        tokenizer=TOKENIZER,
-        mask_p=0.8,
-    )
-
     model = EmbeddingTrainer(
-        input_dims=[args.back_length, 18],
-        a2v_dim=args.a2v_dim,
-        n_encoders=6,
-        n_heads=12,
-        optimizer_params=OPTIM_PARAMS,
-        warmup_steps=args.warmup_steps,
-        max_epochs=args.max_epochs,
-        embedder=None,
-        embedding_type='concat',
+        MODEL_PARAMS,
+        OPTIM_PARAMS,
+        args.warmup_steps,
+        args.max_epochs,
     )
 
     checkpoint = ModelCheckpoint(
         filename='test',
-        monitor='val_loss',
-        mode='min',
+        monitor='val_score',
+        mode='max',
         save_top_k=1,
     )
 
     trainer = pl.Trainer(
-        accelerator='gpu',
+        accelerator='cpu',
         devices=args.n_gpu,
         max_epochs=args.max_epochs,
         logger=neptune_logger,
         callbacks=[checkpoint],
-        fast_dev_run=False
+        fast_dev_run=True,
     )
 
     trainer.fit(model, dm)
