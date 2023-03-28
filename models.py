@@ -173,28 +173,31 @@ class _EncoderLayer(nn.Module):
 class NLPEmbedder(nn.Module):
     def __init__(self, metadata, nlp_dims, total, a2v_dim, activation='gelu', dropout=0.1):
         super(NLPEmbedder, self).__init__()
-        hidden_dim, num_layers = nlp_dims
+        hidden_dim, n_heads, num_layers = nlp_dims
         self.register_buffer('descriptions', metadata.descriptions)
         self.register_buffer('masks', metadata.masks)
+        encoder_layer = nn.TransformerEncoderLayer(hidden_dim, n_heads, dim_feedforward=hidden_dim * 4, dropout=dropout,
+                                                   activation=activation, batch_first=True, norm_first=True)
+        self.lm = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
         roberta_config = RobertaConfig(
-            vocab_size=1600,
+            vocab_size=16000,
             hidden_size=hidden_dim,
             num_hidden_layers=num_layers,
+            num_attention_heads=n_heads,
             intermediate_size=hidden_dim * 4,
             type_vocab_size=1
         )
-        self.lm = RobertaModel(config=roberta_config, add_pooling_layer=False)
+        self.lm = RobertaModel(config=roberta_config, add_pooling_layer=True)
         self.head = nn.Sequential(
-            nn.Dropout(dropout),
             nn.Linear(hidden_dim, a2v_dim),
-            get_activation(activation),
-            nn.Linear(a2v_dim, a2v_dim)
+            nn.Dropout(dropout)
         )
         self.register_buffer('embeds', torch.zeros((total, a2v_dim)))
 
     def forward(self, x, ticker):
-        desc = self.lm(input_ids=self.descriptions[ticker], attention_mask=self.masks[ticker])[0]
-        desc = self.head(desc[:, 0, :]).unsqueeze(1).repeat(1, x.shape[1], 1)
+        desc = self.lm(input_ids=self.descriptions[ticker], attention_mask=self.masks[ticker])[1]
+        desc = self.head(desc).unsqueeze(1).repeat(1, x.shape[1], 1)
         return torch.cat((x, desc), dim=-1)
 
     def compile_embeds(self):

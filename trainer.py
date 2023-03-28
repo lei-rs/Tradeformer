@@ -88,7 +88,7 @@ if __name__ == '__main__':
         'embd_meth': 'nlp',
         'metadata': A2VDescriptions(),
         'total': 1858,
-        'nlp_dims': (48, 6),
+        'nlp_dims': (48, 6, 1),
     }
 
     OPTIM_PARAMS = {
@@ -110,12 +110,12 @@ if __name__ == '__main__':
     )
 
     trainer = pl.Trainer(
-        accelerator='cpu',
+        accelerator='gpu',
         devices=args.n_gpu,
         max_epochs=args.max_epochs,
         logger=neptune_logger,
         callbacks=[checkpoint],
-        fast_dev_run=True,
+        fast_dev_run=False,
     )
 
     trainer.fit(model, dm)

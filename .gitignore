@@ -2,7 +2,6 @@
 .idea/
 __pycache__/
 *.ckpt
-*.json
 *.log
 *.xml
 *.iml
