@@ -74,9 +74,9 @@ if __name__ == '__main__':
     dm = A2VDataModule(
         back_length=args.back_length,
         forward_length=args.forward_length,
-        val_frac=0.3,
+        val_frac=0.2,
         batch_size=args.batch_size,
-        total_train=500,
+        total_train=1000,
     )
 
     MODEL_PARAMS = {

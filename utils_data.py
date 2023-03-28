@@ -13,6 +13,7 @@ def sharpe_loss(weights, returns, perfect=False):
         weights = returns.clone().detach()
         weights[weights < 0] = -1
         weights[weights > 0] = 1
+
     returns = weights * returns * 100
     sharpe = torch.mean(returns) / torch.std(returns)
 
@@ -20,10 +21,10 @@ def sharpe_loss(weights, returns, perfect=False):
 
 
 class A2V(Dataset):
-    def __init__(self, data, features, back_length, forward_length):
+    def __init__(self, data, features, back_length, forward_length, stock_list):
         assert data.shape[0] == features.shape[0], 'Data and features must have the same number of rows'
 
-        self.stocks = dict(zip(list(data.columns), range(len(data.columns))))
+        self.stock_list = dict(zip(stock_list, range(len(stock_list))))
         self.back_length = back_length
         self.forward_length = forward_length
         self.col_list = list(features.columns)
@@ -43,12 +44,10 @@ class A2V(Dataset):
     def __getitem__(self, idx):
         ticker, i = self.range_list[idx]
         j, k = i + self.back_length, i + self.back_length + self.forward_length
-        r1 = self.df.index[i:j]
-        r2 = self.df.index[j:k]
         cols = [ticker] + self.col_list
-        x = torch.from_numpy(self.df.loc[r1, cols].to_numpy())
-        y = torch.from_numpy(self.df.loc[r2, ticker].to_numpy())
-        return x, y, self.stocks[ticker]
+        x = torch.from_numpy(self.df.iloc[i:j][cols].to_numpy())
+        y = torch.from_numpy(self.df.iloc[j:k][ticker].to_numpy())
+        return x, y, self.stock_list[ticker]
 
 
 class A2VDataModule(pl.LightningDataModule):
@@ -64,27 +63,29 @@ class A2VDataModule(pl.LightningDataModule):
 
         self.econ = None
         self.date_split = None
+        self.stock_list = None
         self.stocks_train = None
         self.stocks_val = None
 
     def prepare_data(self):
         self.econ = pd.read_csv(smart_open(self.path + 'data/economic_factors.csv'), index_col=0).astype(np.float32)
         stocks = pd.read_parquet(smart_open(self.path + 'data/t2k_returns.parquet')).astype(np.float32)
+        self.stock_list = list(stocks.columns)
         stocks.index = stocks.index.astype(str)
         num_train = int(stocks.shape[1] * (1 - self.val_frac))
         train_tickers = np.random.choice(list(stocks.loc[:, stocks.count() > 1000].columns), num_train, replace=False)
         val_tickers = list(stocks.columns.difference(train_tickers))
         self.date_split = int(len(stocks) * self.val_frac)
-        self.stocks_train = stocks[train_tickers][:-self.date_split]
-        self.stocks_val = stocks[val_tickers][-self.date_split:]
+        self.stocks_train = stocks[train_tickers].iloc[:-self.date_split]
+        self.stocks_val = stocks[val_tickers].iloc[-self.date_split:]
 
     def train_dataloader(self):
-        train_set = A2V(self.stocks_train, self.econ[:-self.date_split], self.back_length, self.forward_length)
+        train_set = A2V(self.stocks_train, self.econ[:-self.date_split], self.back_length, self.forward_length, self.stock_list)
         sampler = RandomSampler(train_set, replacement=False, num_samples=self.total_train * self.batch_size)
         return DataLoader(train_set, batch_size=self.batch_size, num_workers=4, drop_last=True, sampler=sampler)
 
     def val_dataloader(self):
-        val_set = A2V(self.stocks_val, self.econ[-self.date_split:], self.back_length, self.forward_length)
+        val_set = A2V(self.stocks_val, self.econ[-self.date_split:], self.back_length, self.forward_length, self.stock_list)
         return DataLoader(val_set, batch_size=self.batch_size, num_workers=4, drop_last=True)
 
 
