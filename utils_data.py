@@ -30,7 +30,7 @@ class A2V(Dataset):
         self.col_list = list(features.columns)
         self.counts = [data.shape[0] - count for count in data.count()]
         self.returns = data.copy(deep=True)
-        data = (data - np.nanmean(data, axis=0)) / np.nanstd(data, axis=0)
+        #data = (data - np.nanmean(data, axis=0)) / np.nanstd(data, axis=0)
         self.df = pd.concat([data, features], axis=1)
         self.back_length = back_length
         range_list = [np.arange(start, data.shape[0] - back_length - forward_length - 1)
@@ -47,8 +47,10 @@ class A2V(Dataset):
         ticker, i = self.range_list[idx]
         j, k = i + self.back_length, i + self.back_length + self.forward_length
         cols = [ticker] + self.col_list
-        x = torch.from_numpy(self.df.iloc[i:j][cols].to_numpy())
-        y = torch.from_numpy(self.returns.iloc[j:k][ticker].to_numpy())
+        r1 = self.df.index[i:j]
+        r2 = self.df.index[j:k]
+        x = torch.from_numpy(self.df.loc[r1, cols].to_numpy())
+        y = torch.from_numpy(self.returns.loc[r2, ticker].to_numpy())
         return x, y, self.stock_list[ticker]
 
 
@@ -71,7 +73,7 @@ class A2VDataModule(pl.LightningDataModule):
 
     def prepare_data(self):
         self.econ = pd.read_csv(smart_open(self.path + 'data/economic_factors.csv'), index_col=0).astype(np.float32)
-        stocks = pd.read_parquet(smart_open(self.path + 'data/t2k_returns.parquet'), columns=['AAPL', 'MSFT', 'JPM', 'MS', 'KO']).astype(np.float32)
+        stocks = pd.read_parquet(smart_open(self.path + 'data/t2k_returns.parquet'), columns=['AAPL', 'MSFT']).astype(np.float32)
         self.stock_list = list(stocks.columns)
         stocks.index = stocks.index.astype(str)
         num_train = int(stocks.shape[1] * (1 - self.val_frac))

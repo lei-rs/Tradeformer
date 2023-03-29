@@ -166,9 +166,9 @@ class _MultiheadAttention(nn.Module):
 class _EncoderLayer(nn.Module):
     def __init__(self, hidden_dim, expand_dim, n_heads, activation, dropout):
         super(_EncoderLayer, self).__init__()
-        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm1 = nn.InstanceNorm1d(hidden_dim)
         self.attn = _MultiheadAttention(hidden_dim, n_heads)
-        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.InstanceNorm1d(hidden_dim)
         self.ff = _FeedForward(hidden_dim, expand_dim, activation, dropout)
 
     def forward(self, x):
@@ -227,10 +227,12 @@ class _TFEncoderBlock(nn.Module):
         super(_TFEncoderBlock, self).__init__()
         back_length, n_features, hidden_dim, forward_length = dims
         self.pe = PositionalEmbedding(hidden_dim)
-        self.encoders = nn.Sequential(
+        '''self.encoders = nn.Sequential(
             *[_EncoderLayer(hidden_dim, expand_dim, n_heads, activation, dropout)
               for _ in range(n_encoders)]
-        )
+        )'''
+        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * expand_dim, dropout=dropout, activation=activation, batch_first=True, norm_first=True)
+        self.encoders = nn.TransformerEncoder(encoder_layer, num_layers=n_encoders)
         self.linear = nn.Linear(hidden_dim, 1)
         self.mlp = _MLP(back_length, n_mlp, activation, dropout)
         self.linear2 = nn.Linear(back_length, forward_length)
@@ -259,10 +261,8 @@ class Tradeformer(nn.Module):
             self.linear = nn.Linear(dims[1], dims[2])
             self.embedder = Identity()
 
-        self.norm = nn.LayerNorm(dims[2])
         self.TFEncoder = _TFEncoderBlock(dims, n_encoders, n_heads, n_mlp, expand_dim, activation, dropout)
 
     def forward(self, x, ticker):
-        x = self.norm(x)
         x = self.embedder(x, ticker)
         return self.TFEncoder(x)

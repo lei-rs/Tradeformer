@@ -1,5 +1,5 @@
+from lightning.pytorch.callbacks import ModelCheckpoint, StochasticWeightAveraging
 from transformers.optimization import get_constant_schedule_with_warmup
-from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import NeptuneLogger
 from utils_data import *
 from models import *
@@ -18,8 +18,9 @@ class EmbeddingTrainer(pl.LightningModule):
         self.optimizer_params = optimizer_params
         self.warmup_steps = warmup_steps
         self.max_epochs = max_epochs
-
         self.Tradeformer = Tradeformer(**model_params)
+
+        self.perfect = []
 
     def forward(self, x, ticker):
         return self.Tradeformer(x, ticker)
@@ -29,16 +30,12 @@ class EmbeddingTrainer(pl.LightningModule):
         output = self(x, ticker)
         loss = sharpe_loss(output, y)
         self.log('train_score', loss.item(), on_step=False, on_epoch=True, prog_bar=True)
-        self.log('train_perfect', sharpe_loss(output, y, perfect=True).item(), on_step=False, on_epoch=True, prog_bar=True)
         return {'loss': loss}
 
     def validation_step(self, batch, batch_idx):
         x, y, ticker = batch
         output = self(x, ticker)
         loss = sharpe_loss(output, y)
-        if loss.isnan().any():
-            print(batch_idx)
-            print(batch)
         self.log('val_score', loss.item(), on_step=False, on_epoch=True, prog_bar=True)
         self.log('val_perfect', sharpe_loss(output, y, perfect=True).item(), on_step=False, on_epoch=True, prog_bar=True)
         return {'val_score': loss}
@@ -63,7 +60,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--n_gpu', type=int, default=1)
-    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--learning_rate', type=float, default=1e-3)
     parser.add_argument('--warmup_steps', type=int, default=10)
     parser.add_argument('--max_epochs', type=int, default=25)
@@ -75,7 +72,7 @@ if __name__ == '__main__':
     dm = A2VDataModule(
         back_length=args.back_length,
         forward_length=args.forward_length,
-        val_frac=0.2,
+        val_frac=0.5,
         batch_size=args.batch_size,
         total_train=2000,
     )
@@ -83,7 +80,7 @@ if __name__ == '__main__':
     MODEL_PARAMS = {
         'dims': (args.back_length, 18, 18, args.forward_length),
         'a2v_dim': args.a2v_dim,
-        'n_encoders': 6,
+        'n_encoders': 1,
         'n_heads': 6,
         'n_mlp': 1,
         'embd_meth': 'none',
@@ -115,7 +112,8 @@ if __name__ == '__main__':
         devices=args.n_gpu,
         max_epochs=args.max_epochs,
         logger=neptune_logger,
-        callbacks=[checkpoint],
+        callbacks=[checkpoint,
+                   StochasticWeightAveraging(swa_lrs=1e-2)],
         fast_dev_run=False,
     )
 
