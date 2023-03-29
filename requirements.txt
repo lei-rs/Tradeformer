@@ -1,6 +1,5 @@
 transformers
 smart_open
-neptune-client
+neptune
 pyarrow
 lightning
-neptune-pytorch-lightning

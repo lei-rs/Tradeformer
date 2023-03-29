@@ -4,8 +4,8 @@ from lightning.pytorch.loggers import NeptuneLogger
 from utils_data import *
 from models import *
 from keys import *
-import neptune.new as neptune
 import argparse
+import neptune
 import boto3
 import uuid
 
@@ -36,6 +36,9 @@ class EmbeddingTrainer(pl.LightningModule):
         x, y, ticker = batch
         output = self(x, ticker)
         loss = sharpe_loss(output, y)
+        if loss.isnan().any():
+            print(batch_idx)
+            print(batch)
         self.log('val_score', loss.item(), on_step=False, on_epoch=True, prog_bar=True)
         self.log('val_perfect', sharpe_loss(output, y, perfect=True).item(), on_step=False, on_epoch=True, prog_bar=True)
         return {'val_score': loss}
@@ -53,16 +56,14 @@ class EmbeddingTrainer(pl.LightningModule):
 if __name__ == '__main__':
     torch.set_float32_matmul_precision('medium')
 
-    run = neptune.init_run(
-        api_token=NEPTUNE_API_TOKEN,
-        project='lei-research/ASEC',)
+    run = neptune.init_run(api_token=NEPTUNE_API_TOKEN, project='lei-research/ASEC')
     uuid = str(uuid.uuid4())
     run['uuid'] = uuid
     neptune_logger = NeptuneLogger(run=run)
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--n_gpu', type=int, default=1)
-    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--learning_rate', type=float, default=1e-3)
     parser.add_argument('--warmup_steps', type=int, default=10)
     parser.add_argument('--max_epochs', type=int, default=25)
@@ -76,16 +77,16 @@ if __name__ == '__main__':
         forward_length=args.forward_length,
         val_frac=0.2,
         batch_size=args.batch_size,
-        total_train=1000,
+        total_train=2000,
     )
 
     MODEL_PARAMS = {
-        'dims': (args.back_length, 18, 18 + args.a2v_dim, args.forward_length),
+        'dims': (args.back_length, 18, 18, args.forward_length),
         'a2v_dim': args.a2v_dim,
         'n_encoders': 6,
         'n_heads': 6,
         'n_mlp': 1,
-        'embd_meth': 'nlp',
+        'embd_meth': 'none',
         'metadata': A2VDescriptions(),
         'total': 1858,
         'nlp_dims': (48, 6, 1),

@@ -20,6 +20,14 @@ def get_activation(activation):
         raise NotImplementedError("Activation not implemented")
 
 
+class Identity(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super(Identity, self).__init__()
+
+    def forward(self, x, *args, **kwargs):
+        return x
+
+
 class ScaleShift(nn.Module):
     def __init__(self, dim):
         super(ScaleShift, self).__init__()
@@ -176,10 +184,6 @@ class NLPEmbedder(nn.Module):
         hidden_dim, n_heads, num_layers = nlp_dims
         self.register_buffer('descriptions', metadata.descriptions)
         self.register_buffer('masks', metadata.masks)
-        encoder_layer = nn.TransformerEncoderLayer(hidden_dim, n_heads, dim_feedforward=hidden_dim * 4, dropout=dropout,
-                                                   activation=activation, batch_first=True, norm_first=True)
-        self.lm = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
         roberta_config = RobertaConfig(
             vocab_size=16000,
             hidden_size=hidden_dim,
@@ -201,20 +205,16 @@ class NLPEmbedder(nn.Module):
         return torch.cat((x, desc), dim=-1)
 
     def compile_embeds(self):
-        self.register_buffer('embeds', self.head(self.lm(input_ids=self.descriptions, attention_mask=self.masks)[0][:, 0, :]).unsqueeze(1))
+        self.register_buffer('embeds', self.head(self.lm(input_ids=self.descriptions, attention_mask=self.masks)[1]).unsqueeze(1))
 
 
 class EmbedDict(nn.Module):
-    def __init__(self, a2v_dim, total, learnable=True):
+    def __init__(self, a2v_dim, total):
         super(EmbedDict, self).__init__()
-        if learnable:
-            self.embed = nn.Parameter(torch.normal(0, 1, (total, a2v_dim)))
-
-        else:
-            self.register_buffer('embeds', torch.zeros((total, a2v_dim)))
+        self.embed = nn.Parameter(torch.normal(0, 1, (total, a2v_dim)))
 
     def forward(self, x, ticker):
-        embd = self.embed[ticker].repeat(1, x.shape[1], 1)
+        embd = self.embed[ticker].unsqueeze(1).repeat(1, x.shape[1], 1)
         return torch.cat((x, embd), dim=-1)
 
     def compile_embeds(self):
@@ -248,15 +248,18 @@ class Tradeformer(nn.Module):
                  expand_dim=4, activation='gelu', dropout=0.1):
         super(Tradeformer, self).__init__()
         if embd_meth == 'nlp':
+            self.linear = nn.Linear(dims[1] + a2v_dim, dims[2])
             self.embedder = NLPEmbedder(metadata, nlp_dims, total, a2v_dim, activation, dropout)
 
         elif embd_meth == 'dict':
+            self.linear = nn.Linear(dims[1] + a2v_dim, dims[2])
             self.embedder = EmbedDict(a2v_dim, total)
 
         else:
-            self.embedder = EmbedDict(a2v_dim, total, learnable=False)
+            self.linear = nn.Linear(dims[1], dims[2])
+            self.embedder = Identity()
 
-        self.norm = nn.LayerNorm(dims[1])
+        self.norm = nn.LayerNorm(dims[2])
         self.TFEncoder = _TFEncoderBlock(dims, n_encoders, n_heads, n_mlp, expand_dim, activation, dropout)
 
     def forward(self, x, ticker):

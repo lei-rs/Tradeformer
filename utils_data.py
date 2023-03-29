@@ -29,6 +29,8 @@ class A2V(Dataset):
         self.forward_length = forward_length
         self.col_list = list(features.columns)
         self.counts = [data.shape[0] - count for count in data.count()]
+        self.returns = data.copy(deep=True)
+        data = (data - np.nanmean(data, axis=0)) / np.nanstd(data, axis=0)
         self.df = pd.concat([data, features], axis=1)
         self.back_length = back_length
         range_list = [np.arange(start, data.shape[0] - back_length - forward_length - 1)
@@ -46,7 +48,7 @@ class A2V(Dataset):
         j, k = i + self.back_length, i + self.back_length + self.forward_length
         cols = [ticker] + self.col_list
         x = torch.from_numpy(self.df.iloc[i:j][cols].to_numpy())
-        y = torch.from_numpy(self.df.iloc[j:k][ticker].to_numpy())
+        y = torch.from_numpy(self.returns.iloc[j:k][ticker].to_numpy())
         return x, y, self.stock_list[ticker]
 
 
@@ -69,23 +71,23 @@ class A2VDataModule(pl.LightningDataModule):
 
     def prepare_data(self):
         self.econ = pd.read_csv(smart_open(self.path + 'data/economic_factors.csv'), index_col=0).astype(np.float32)
-        stocks = pd.read_parquet(smart_open(self.path + 'data/t2k_returns.parquet')).astype(np.float32)
+        stocks = pd.read_parquet(smart_open(self.path + 'data/t2k_returns.parquet'), columns=['AAPL', 'MSFT', 'JPM', 'MS', 'KO']).astype(np.float32)
         self.stock_list = list(stocks.columns)
         stocks.index = stocks.index.astype(str)
         num_train = int(stocks.shape[1] * (1 - self.val_frac))
         train_tickers = np.random.choice(list(stocks.loc[:, stocks.count() > 1000].columns), num_train, replace=False)
         val_tickers = list(stocks.columns.difference(train_tickers))
         self.date_split = int(len(stocks) * self.val_frac)
-        self.stocks_train = stocks[train_tickers].iloc[:-self.date_split]
-        self.stocks_val = stocks[val_tickers].iloc[-self.date_split:]
+        self.stocks_train = stocks[train_tickers] #.iloc[:-self.date_split]
+        self.stocks_val = stocks[val_tickers] #.iloc[-self.date_split:]
 
     def train_dataloader(self):
-        train_set = A2V(self.stocks_train, self.econ[:-self.date_split], self.back_length, self.forward_length, self.stock_list)
-        sampler = RandomSampler(train_set, replacement=False, num_samples=self.total_train * self.batch_size)
-        return DataLoader(train_set, batch_size=self.batch_size, num_workers=4, drop_last=True, sampler=sampler)
+        train_set = A2V(self.stocks_train, self.econ, self.back_length, self.forward_length, self.stock_list)
+        #sampler = RandomSampler(train_set, replacement=False, num_samples=self.total_train * self.batch_size)
+        return DataLoader(train_set, batch_size=self.batch_size, num_workers=4, drop_last=True)
 
     def val_dataloader(self):
-        val_set = A2V(self.stocks_val, self.econ[-self.date_split:], self.back_length, self.forward_length, self.stock_list)
+        val_set = A2V(self.stocks_val, self.econ, self.back_length, self.forward_length, self.stock_list)
         return DataLoader(val_set, batch_size=self.batch_size, num_workers=4, drop_last=True)
 
 
@@ -93,7 +95,7 @@ class A2VDescriptions:
     def __init__(self, path=S3_PATH):
         self.tokenizer = RobertaTokenizer.from_pretrained('tokenizer/')
         self.path = path
-        self.metadata = pd.read_csv(smart_open(self.path + 'data/t2k_metadata.csv'), index_col=0, dtype=str)
+        self.metadata = pd.read_parquet(smart_open(self.path + 'data/t2k_metadata.parquet')).astype(str)
         self.tokenized = self.tokenizer(
             list(self.metadata.loc['Description']), max_length=512, return_tensors='pt', padding='max_length',
             return_attention_mask=True, is_split_into_words=False
