@@ -1,5 +1,0 @@
-transformers
-smart_open
-neptune
-pyarrow
-lightning

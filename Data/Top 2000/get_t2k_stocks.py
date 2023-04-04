@@ -2,16 +2,14 @@ from tqdm import tqdm
 from keys import *
 import pandas as pd
 import numpy as np
-import quandl
+import yfinance as yf
 
 
 def get_data():
-    quandl.ApiConfig.api_key = QUANDL_KEY
     stock_list = sorted(list(pd.read_csv('stock_tickers.csv', header=None)[0]))
 
     for stock in tqdm(stock_list):
-        prices = quandl.get_table('QUOTEMEDIA/PRICES', ticker=stock, qopts={'columns': ['date', 'adj_close']},
-                                  paginate=True).set_index('date').sort_index().loc['2001-01-01':'2022-10-31'][::-1]
+        prices = yf.download(stock, start='2001-01-01', end='2022-11-01', progress=False)['Adj Close']
         if stock[0] is None:
             continue
 

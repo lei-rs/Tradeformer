@@ -1,4 +1,5 @@
-from transformers import RobertaModel, RobertaConfig
+from transformers import DistilBertModel
+from utils_data import *
 import torch.nn.functional as nnf
 import torch.nn as nn
 import torch
@@ -27,6 +28,9 @@ class Identity(nn.Module):
     def forward(self, x, *args, **kwargs):
         return x
 
+    def get_embd(self, ticker):
+        return None
+
 
 class ScaleShift(nn.Module):
     def __init__(self, dim):
@@ -38,44 +42,6 @@ class ScaleShift(nn.Module):
 
     def forward(self, x):
         return x * self.scale + self.shift
-
-
-class InstanceNorm(nn.Module):
-    def __init__(self, dim, affine=True):
-        super(InstanceNorm, self).__init__()
-        self.affine = affine
-
-        if affine:
-            self.to_x = ScaleShift(dim)
-
-    def forward(self, x):
-        assert len(x.shape) == 3, 'Input must be of shape (batch_size, seq_len, input_dim)'
-        x = (x - torch.mean(x, dim=1, keepdim=True)) / torch.std(x, dim=1, keepdim=True)
-
-        if self.affine:
-            return self.to_x(x)
-
-        return x
-
-
-class SwiGLU(nn.Module):
-    def __init__(self, dim, affine=True):
-        super(SwiGLU, self).__init__()
-        self.dim = dim
-        self.affine = affine
-
-        if affine:
-            self.to_x = ScaleShift(dim)
-            self.to_gate = ScaleShift(dim)
-
-    def forward(self, x):
-        assert x.shape[-1] / 2 == self.dim, ''
-        x, gate = x.chunk(2, dim=-1)
-
-        if self.affine:
-            return nnf.silu(self.to_gate(gate)) * self.to_x(x)
-
-        return nnf.silu(gate) * x
 
 
 class PositionalEmbedding(nn.Module):
@@ -112,9 +78,9 @@ class _FeedForward(nn.Module):
         return self.ff(x)
 
 
-class _MLP(nn.Module):
+class MLP(nn.Module):
     def __init__(self, hidden_dim, n_mlp, activation, dropout):
-        super(_MLP, self).__init__()
+        super(MLP, self).__init__()
         modlist = []
         for _ in range(n_mlp):
             modlist += [nn.Linear(hidden_dim, hidden_dim),
@@ -166,103 +132,67 @@ class _MultiheadAttention(nn.Module):
 class _EncoderLayer(nn.Module):
     def __init__(self, hidden_dim, expand_dim, n_heads, activation, dropout):
         super(_EncoderLayer, self).__init__()
-        self.norm1 = nn.InstanceNorm1d(hidden_dim)
+        self.norm1 = nn.LayerNorm(hidden_dim)
         self.attn = _MultiheadAttention(hidden_dim, n_heads)
-        self.norm2 = nn.InstanceNorm1d(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
         self.ff = _FeedForward(hidden_dim, expand_dim, activation, dropout)
 
     def forward(self, x):
-        self.norm1(x)
-        x = self.attn(x, x, x) + x
-        self.norm2(x)
-        return self.ff(x) + x
+        #x = self.norm1(x)
+        x = x + self.attn(x, x, x)
+        #x = self.norm2(x)
+        x = x + self.ff(x)
+        return x
 
 
 class NLPEmbedder(nn.Module):
-    def __init__(self, metadata, nlp_dims, total, a2v_dim, activation='gelu', dropout=0.1):
+    def __init__(self, a2v_dim, total, dropout=0.1):
         super(NLPEmbedder, self).__init__()
-        hidden_dim, n_heads, num_layers = nlp_dims
+        metadata = Descriptions()
         self.register_buffer('descriptions', metadata.descriptions)
         self.register_buffer('masks', metadata.masks)
-        roberta_config = RobertaConfig(
-            vocab_size=16000,
-            hidden_size=hidden_dim,
-            num_hidden_layers=num_layers,
-            num_attention_heads=n_heads,
-            intermediate_size=hidden_dim * 4,
-            type_vocab_size=1
-        )
-        self.lm = RobertaModel(config=roberta_config, add_pooling_layer=True)
+        self.lm = DistilBertModel.from_pretrained('distilbert-base-uncased')
         self.head = nn.Sequential(
-            nn.Linear(hidden_dim, a2v_dim),
+            nn.Linear(768, 768),
+            nn.ReLU(),
+            nn.Linear(768, a2v_dim),
             nn.Dropout(dropout)
         )
         self.register_buffer('embeds', torch.zeros((total, a2v_dim)))
 
     def forward(self, x, ticker):
-        desc = self.lm(input_ids=self.descriptions[ticker], attention_mask=self.masks[ticker])[1]
-        desc = self.head(desc).unsqueeze(1).repeat(1, x.shape[1], 1)
+        desc = self.lm(input_ids=self.descriptions[ticker[0]], attention_mask=self.masks[ticker[0]])[0].mean(dim=1)
+        desc = self.head(desc)
         return torch.cat((x, desc), dim=-1)
 
     def compile_embeds(self):
         self.register_buffer('embeds', self.head(self.lm(input_ids=self.descriptions, attention_mask=self.masks)[1]).unsqueeze(1))
 
 
-class EmbedDict(nn.Module):
-    def __init__(self, a2v_dim, total):
-        super(EmbedDict, self).__init__()
-        self.embed = nn.Parameter(torch.normal(0, 1, (total, a2v_dim)))
-
-    def forward(self, x, ticker):
-        embd = self.embed[ticker].unsqueeze(1).repeat(1, x.shape[1], 1)
-        return torch.cat((x, embd), dim=-1)
-
-    def compile_embeds(self):
-        pass
-
-
-class _TFEncoderBlock(nn.Module):
-    def __init__(self, dims, n_encoders, n_heads, n_mlp, expand_dim=4, activation='gelu',
-                 dropout=0.1):
-        super(_TFEncoderBlock, self).__init__()
-        back_length, n_features, hidden_dim, forward_length = dims
+class TFEncoderBlock(nn.Module):
+    def __init__(self, dims, a2v_dim, n_encoders, n_heads, n_mlp, expand_dim=4, activation='gelu', dropout=0.1):
+        super(TFEncoderBlock, self).__init__()
+        back_length, n_features, forward_length = dims
+        hidden_dim = n_features
         self.pe = PositionalEmbedding(hidden_dim)
         '''self.encoders = nn.Sequential(
             *[_EncoderLayer(hidden_dim, expand_dim, n_heads, activation, dropout)
               for _ in range(n_encoders)]
         )'''
-        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * expand_dim, dropout=dropout, activation=activation, batch_first=True, norm_first=True)
-        self.encoders = nn.TransformerEncoder(encoder_layer, num_layers=n_encoders)
+        encoder = nn.TransformerEncoderLayer(hidden_dim, n_heads, hidden_dim * expand_dim, dropout, activation, batch_first=True, norm_first=True)
+        self.encoders = nn.TransformerEncoder(encoder, n_encoders)
         self.linear = nn.Linear(hidden_dim, 1)
-        self.mlp = _MLP(back_length, n_mlp, activation, dropout)
+        self.norm2 = nn.LayerNorm(back_length)
+        self.mlp = MLP(back_length, n_mlp, activation, dropout)
         self.linear2 = nn.Linear(back_length, forward_length)
 
-    def forward(self, x):
+    def forward(self, x, embd):
+        #embd = embd.unsqueeze(1).expand(-1, x.shape[1], -1)
+        #x = torch.cat((x, embd), dim=-1)
         x = self.pe(x)
         x = self.encoders(x)
         x = self.linear(x).squeeze(-1)
+        x = self.norm2(x)
         x = self.mlp(x)
-        return nnf.tanh(self.linear2(x).squeeze(-1))
-
-
-class Tradeformer(nn.Module):
-    def __init__(self, dims, a2v_dim, n_encoders, n_heads, n_mlp, embd_meth, metadata, total, nlp_dims,
-                 expand_dim=4, activation='gelu', dropout=0.1):
-        super(Tradeformer, self).__init__()
-        if embd_meth == 'nlp':
-            self.linear = nn.Linear(dims[1] + a2v_dim, dims[2])
-            self.embedder = NLPEmbedder(metadata, nlp_dims, total, a2v_dim, activation, dropout)
-
-        elif embd_meth == 'dict':
-            self.linear = nn.Linear(dims[1] + a2v_dim, dims[2])
-            self.embedder = EmbedDict(a2v_dim, total)
-
-        else:
-            self.linear = nn.Linear(dims[1], dims[2])
-            self.embedder = Identity()
-
-        self.TFEncoder = _TFEncoderBlock(dims, n_encoders, n_heads, n_mlp, expand_dim, activation, dropout)
-
-    def forward(self, x, ticker):
-        x = self.embedder(x, ticker)
-        return self.TFEncoder(x)
+        x = self.linear2(x).squeeze(-1)
+        return nnf.tanh(x)

@@ -8,7 +8,7 @@ def get_metadata():
     chrome_options = Options()
     chrome_options.add_argument("--headless")
     driver = webdriver.Chrome(executable_path='chromedriver.exe', options=chrome_options)
-    stock_list = sorted(list(pd.read_csv('stock_tickers.csv', header=None)[0]))
+    stock_list = sorted(list(pd.read_csv('stock_tickers.csv', header=None).iloc[0]))
     metadata = pd.DataFrame(columns=stock_list)
 
     for stock in tqdm(stock_list):
