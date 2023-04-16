@@ -32,18 +32,6 @@ class Identity(nn.Module):
         return None
 
 
-class ScaleShift(nn.Module):
-    def __init__(self, dim):
-        super(ScaleShift, self).__init__()
-        self.scale = nn.Parameter(torch.Tensor(dim))
-        self.shift = nn.Parameter(torch.Tensor(dim))
-        self.scale.data.fill_(1)
-        self.shift.data.fill_(0)
-
-    def forward(self, x):
-        return x * self.scale + self.shift
-
-
 class PositionalEmbedding(nn.Module):
     def __init__(self, d_model, max_len=5000):
         super(PositionalEmbedding, self).__init__()
@@ -62,6 +50,42 @@ class PositionalEmbedding(nn.Module):
 
     def forward(self, x):
         return x + self.pe[:, :x.size(1)]
+
+
+class GLU(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super(GLU, self).__init__()
+        self.linear = nn.Linear(hidden_dim, input_dim * 2)
+
+    def forward(self, x):
+        x = self.linear(x)
+        return nnf.glu(x, dim=-1)
+
+
+class GRN(nn.Module):
+    def __init__(self, input_dim, hidden_dim, activation, dropout, context_dim=None):
+        super(GRN, self).__init__()
+        self.norm = nn.LayerNorm(input_dim)
+        self.linear1 = nn.Linear(input_dim, hidden_dim)
+        if context_dim:
+            self.to_context = nn.Linear(context_dim, hidden_dim)
+        self.activation = get_activation(activation)
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.glu = GLU(input_dim, hidden_dim)
+        self.norm = nn.LayerNorm(input_dim)
+
+    def forward(self, x, context=None):
+        x = self.norm(x)
+        res = x
+        x = self.linear1(x)
+        if context is not None:
+            x = x + self.to_context(context)[:, None, :]
+        x = self.activation(x)
+        x = self.linear2(x)
+        x = self.dropout(x)
+        x = self.glu(x)
+        return res + x
 
 
 class _FeedForward(nn.Module):
@@ -93,7 +117,6 @@ class MLP(nn.Module):
         return self.mlp(x)
 
 
-# Not Used
 class _MultiheadAttention(nn.Module):
     def __init__(self, embed_dim, n_heads):
         super().__init__()
@@ -107,15 +130,18 @@ class _MultiheadAttention(nn.Module):
         self.to_values = nn.Linear(embed_dim, embed_dim, bias=False)
         self.to_out = nn.Linear(embed_dim, embed_dim, bias=False)
 
-    def forward(self, queries, keys, values, mask=None):
+    def forward(self, queries, keys, values, q_len=None):
         batch_size, seq_len, embed_dim = values.shape
         head_dim = embed_dim // self.n_heads
 
-        queries = self.to_queries(queries).view(batch_size, seq_len, self.n_heads, head_dim)
+        if q_len is None:
+            q_len = seq_len
+
+        queries = self.to_queries(queries).view(batch_size, q_len, self.n_heads, head_dim)
         keys = self.to_keys(keys).view(batch_size, seq_len, self.n_heads, head_dim)
         values = self.to_values(values).view(batch_size, seq_len, self.n_heads, head_dim)
 
-        queries = queries.transpose(1, 2).contiguous().view(batch_size * self.n_heads, seq_len, head_dim)
+        queries = queries.transpose(1, 2).contiguous().view(batch_size * self.n_heads, q_len, head_dim)
         keys = keys.transpose(1, 2).contiguous().view(batch_size * self.n_heads, seq_len, head_dim)
         values = values.transpose(1, 2).contiguous().view(batch_size * self.n_heads, seq_len, head_dim)
 
@@ -124,8 +150,8 @@ class _MultiheadAttention(nn.Module):
 
         out = torch.bmm(queries, keys.transpose(1, 2))
         out = torch.softmax(out, dim=-1)
-        out = torch.bmm(out, values).view(batch_size, self.n_heads, seq_len, head_dim)
-        out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.n_heads * head_dim)
+        out = torch.bmm(out, values).view(batch_size, self.n_heads, q_len, head_dim)
+        out = out.transpose(1, 2).contiguous().view(batch_size, q_len, self.n_heads * head_dim)
         return self.to_out(out)
 
 
@@ -138,11 +164,28 @@ class _EncoderLayer(nn.Module):
         self.ff = _FeedForward(hidden_dim, expand_dim, activation, dropout)
 
     def forward(self, x):
-        #x = self.norm1(x)
         x = x + self.attn(x, x, x)
-        #x = self.norm2(x)
+        x = self.norm1(x)
         x = x + self.ff(x)
+        x = self.norm2(x)
         return x
+
+
+class _DecoderLayer(nn.Module):
+    def __init__(self, hidden_dim, expand_dim, n_heads, activation, dropout):
+        super(_DecoderLayer, self).__init__()
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.attn = _MultiheadAttention(hidden_dim, n_heads)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.ff = _FeedForward(hidden_dim, expand_dim, activation, dropout)
+
+    def forward(self, xs):
+        x, context = xs
+        x = x + self.attn(x, context, context, 1)
+        x = self.norm1(x)
+        x = self.ff(x)
+        x = self.norm2(x)
+        return [x, context]
 
 
 class NLPEmbedder(nn.Module):
@@ -169,30 +212,48 @@ class NLPEmbedder(nn.Module):
         self.register_buffer('embeds', self.head(self.lm(input_ids=self.descriptions, attention_mask=self.masks)[1]).unsqueeze(1))
 
 
-class TFEncoderBlock(nn.Module):
-    def __init__(self, dims, a2v_dim, n_encoders, n_heads, n_mlp, expand_dim=4, activation='gelu', dropout=0.1):
-        super(TFEncoderBlock, self).__init__()
-        back_length, n_features, forward_length = dims
-        hidden_dim = n_features
+class Tradeformer(nn.Module):
+    def __init__(self, dims, a2v_dim, n_encoders, n_decoders, n_heads, expand_dim=4, activation='gelu', dropout=0.1):
+        super(Tradeformer, self).__init__()
+        back_length, n_features, hidden_dim = dims
+        #self.GRN = GRN(n_features, hidden_dim, activation, dropout, a2v_dim)
+        self.to_hidden = nn.Linear(n_features, hidden_dim)
         self.pe = PositionalEmbedding(hidden_dim)
-        '''self.encoders = nn.Sequential(
-            *[_EncoderLayer(hidden_dim, expand_dim, n_heads, activation, dropout)
-              for _ in range(n_encoders)]
-        )'''
         encoder = nn.TransformerEncoderLayer(hidden_dim, n_heads, hidden_dim * expand_dim, dropout, activation, batch_first=True, norm_first=True)
         self.encoders = nn.TransformerEncoder(encoder, n_encoders)
-        self.linear = nn.Linear(hidden_dim, 1)
-        self.norm2 = nn.LayerNorm(back_length)
-        self.mlp = MLP(back_length, n_mlp, activation, dropout)
-        self.linear2 = nn.Linear(back_length, forward_length)
+        '''decoder = nn.TransformerDecoderLayer(hidden_dim, n_heads, hidden_dim * expand_dim, dropout, activation, batch_first=True, norm_first=True)
+        self.decoders = nn.TransformerDecoder(decoder, n_decoders)'''
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.linear = nn.Linear(hidden_dim, hidden_dim)
+        self.gelu = nn.GELU(approximate='tanh')
+        self.linear2 = nn.Linear(hidden_dim, 1)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, embd):
-        #embd = embd.unsqueeze(1).expand(-1, x.shape[1], -1)
-        #x = torch.cat((x, embd), dim=-1)
+        x = self.to_hidden(x)
         x = self.pe(x)
-        x = self.encoders(x)
-        x = self.linear(x).squeeze(-1)
-        x = self.norm2(x)
-        x = self.mlp(x)
-        x = self.linear2(x).squeeze(-1)
+        x = self.encoders(x)[:, -1, :]
+        x = self.norm(x)
+        x = self.linear(x)
+        x = self.gelu(x)
+        x = self.dropout(x)
+        x = self.linear2(x)
+        return nnf.tanh(x)
+
+
+class LSTM(nn.Module):
+    def __init__(self, dims):
+        super(LSTM, self).__init__()
+        back_length, n_features, hidden_dim = dims
+        self.norm = nn.LayerNorm(n_features)
+        self.LSTM = nn.LSTM(n_features, hidden_dim, 1, batch_first=True)
+        self.linear = nn.Linear(hidden_dim, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x):
+        x = self.norm(x)
+        x, _ = self.LSTM(x)
+        x = self.linear(x[:, -1, :])
+        x = nnf.gelu(x)
+        x = self.linear2(x)
         return nnf.tanh(x)

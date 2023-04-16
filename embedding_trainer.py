@@ -23,9 +23,9 @@ class EmbeddingDataset(Dataset):
         return torch.from_numpy(self.data.iloc[:, idx].to_numpy())
 
 
-class Autoencoder(pl.LightningModule):
+class VAE(pl.LightningModule):
     def __init__(self, input_dim, a2v_dim, dropout=0.1):
-        super(Autoencoder, self).__init__()
+        super(VAE, self).__init__()
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, input_dim // 2),
             nn.ReLU(),
@@ -64,7 +64,8 @@ class Autoencoder(pl.LightningModule):
 
 if __name__ == '__main__':
     np.random.seed(42)
-    DATA = pd.read_parquet(smart_open(S3_PATH + 'data/t2k_returns_embd.parquet')).astype(np.float32)[-966:]
+    idx = pd.IndexSlice
+    DATA = pd.read_parquet(smart_open(S3_PATH + 'data/train.parquet')).astype(np.float32).loc[:, idx[:, 'target']][-966:]
     DATA = (DATA - np.mean(DATA, axis=0)) / np.std(DATA, axis=0)
     train_stocks = np.random.choice(DATA.columns, int(0.8 * len(DATA.columns)), replace=False)
     train = DATA[train_stocks]
@@ -72,7 +73,7 @@ if __name__ == '__main__':
     val = DATA[val_stocks]
     train_dl = DataLoader(EmbeddingDataset(train), batch_size=8, num_workers=6, shuffle=True)
     val_dl = DataLoader(EmbeddingDataset(val), batch_size=8, num_workers=6, shuffle=False)
-    model = Autoencoder(966, 9)
+    model = VAE(966, 9)
     checkpoint = ModelCheckpoint(monitor='val_loss', save_top_k=1)
     trainer = pl.Trainer(accelerator='gpu', max_epochs=50, callbacks=[checkpoint], fast_dev_run=False)
     trainer.fit(model, train_dl, val_dl)
